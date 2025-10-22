@@ -160,6 +160,9 @@
       };
 
       ws.onerror = (e) => log("❌ WS error:", e.message || e);
+      ws.onerror = (e) => log("❌ WS error event (див. onclose для деталей)", e);
+      ws.onclose = (ev) => log("ℹ️ WS closed", { code: ev.code, reason: ev.reason });
+``
       ws.onclose = () => {
         log("ℹ️ WebSocket закрито");
         $("disconnectBtn").disabled = true;
@@ -260,4 +263,5 @@
 })();
 </script>
 </body>
+
 </html>
