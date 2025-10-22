@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Voice Agent Test Client</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    .row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+    input[type="text"] { width: 520px; padding: 8px; }
+    button { padding: 8px 12px; }
+    .log { border: 1px solid #ccc; padding: 8px; height: 240px; overflow: auto; white-space: pre-wrap; background: #fafafa; }
+    .small { font-size: 0.9em; color: #666; }
+    label { display: inline-flex; align-items: center; gap: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Голосовий агент — тестовий клієнт</h1>
+
+  <div class="row">
+    <label>WebSocket URL:
+      <input id="wsUrl" type="text" placeholder="wss://YOUR-CLOUD-RUN-URL/audio" />
+    </label>
+  </div>
+
+  <div class="row">
+    <button id="connectBtn">Почати сеанс</button>
+    <button id="disconnectBtn" disabled>Завершити сеанс</button>
+  </div>
+
+  <hr/>
+
+  <div class="row">
+    <button id="startMicBtn" disabled>🎙️ Почати мікрофон</button>
+    <button id="stopMicBtn" disabled>⏹️ Зупинити мікрофон</button>
+  </div>
+
+  <div class="row">
+    <input id="textInput" type="text" placeholder="Надіслати текст..." />
+    <label><input type="checkbox" id="turnComplete"> turn_complete</label>
+    <button id="sendTextBtn" disabled>Надіслати</button>
+  </div>
+
+  <p class="small">Примітка: клієнт надсилає PCM16 mono @ 16kHz у двійкових фреймах; отримане аудіо (PCM16 mono @ 24kHz) відтворюється автоматично.</p>
+
+  <h3>Логи</h3>
+  <div id="log" class="log"></div>
+
+<script>
+(() => {
+  // ---- UI helpers ----
+  const $ = (id) => document.getElementById(id);
+  const logBox = $("log");
+  function log(...args) {
+    const line = args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+    logBox.textContent += line + "\n";
+    logBox.scrollTop = logBox.scrollHeight;
+    console.log(...args);
+  }
+
+  // ---- State ----
+  let ws = null;
+  let audioCtx = null;
+  let micStream = null;
+  let micNode = null;        // AudioWorkletNode
+  let playerNextTime = 0;    // schedule time for next buffer
+
+  // Server audio format (from our FastAPI bridge / Google Live API)
+  const MODEL_SAMPLE_RATE = 24000; // matches server RECV_SAMPLE_RATE
+  // Client send format
+  const SEND_SAMPLE_RATE = 16000;  // must match server SEND_SAMPLE_RATE and MIME
+
+  // ---- Audio: downsampler worklet (float32 -> PCM16 @16kHz) ----
+  const workletCode = `
+    class Downsample16k extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this._srcRate = sampleRate; // context sample rate (e.g., 48000)
+        this._acc = 0;
+        this._carry = 0;
+        this._ratio = this._srcRate / 16000;
+      }
+      static get parameterDescriptors() { return []; }
+
+      process(inputs, outputs, parameters) {
+        const input = inputs[0];
+        if (!input || input.length === 0) { return true; }
+        const ch0 = input[0]; // mono or take left
+        if (!ch0) return true;
+
+        const inBuf = ch0; // Float32Array
+        // Downsample with simple linear interpolation
+        const ratio = this._ratio;
+        const outNeeded = Math.floor(inBuf.length / ratio) + 1;
+        const outF32 = new Float32Array(outNeeded);
+        let idx = 0;
+        for (let i = 0; i < outNeeded; i++) {
+          const pos = i * ratio;
+          const i0 = Math.floor(pos);
+          const i1 = Math.min(i0 + 1, inBuf.length - 1);
+          const t = pos - i0;
+          const s = (1 - t) * inBuf[i0] + t * inBuf[i1];
+          outF32[idx++] = Math.max(-1, Math.min(1, s));
+        }
+
+        // Convert to PCM16
+        const outI16 = new Int16Array(outF32.length);
+        for (let i = 0; i < outF32.length; i++) {
+          outI16[i] = Math.max(-32768, Math.min(32767, Math.floor(outF32[i] * 32767)));
+        }
+
+        // Post to main thread
+        this.port.postMessage(outI16.buffer, [outI16.buffer]);
+        return true;
+      }
+    }
+    registerProcessor('downsample-16k', Downsample16k);
+  `;
+
+  async function ensureAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const blob = new Blob([workletCode], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+  }
+
+  // ---- WebSocket connect/disconnect ----
+  $("connectBtn").onclick = async () => {
+    const url = $("wsUrl").value.trim();
+    if (!url || !/^wss:\/\/.+/.test(url)) {
+      alert("Вкажіть правильний WebSocket URL (wss://...)");
+      return;
+    }
+    try {
+      ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => {
+        log("✅ WebSocket з'єднано");
+        $("disconnectBtn").disabled = false;
+        $("startMicBtn").disabled = false;
+        $("sendTextBtn").disabled = false;
+      };
+
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          // JSON events: transcripts, tool events, etc.
+          try {
+            const obj = JSON.parse(ev.data);
+            log("📩 JSON:", obj);
+          } catch {
+            log("📩 text:", ev.data);
+          }
+        } else if (ev.data instanceof ArrayBuffer) {
+          // Binary model audio (PCM16 @ 24kHz)
+          playPcmChunk(ev.data);
+        }
+      };
+
+      ws.onerror = (e) => log("❌ WS error:", e.message || e);
+      ws.onclose = () => {
+        log("ℹ️ WebSocket закрито");
+        $("disconnectBtn").disabled = true;
+        $("startMicBtn").disabled = true;
+        $("stopMicBtn").disabled = true;
+        $("sendTextBtn").disabled = true;
+        ws = null;
+        stopMic();
+      };
+    } catch (e) {
+      log("❌ Не вдалося підключитися:", e);
+    }
+  };
+
+  $("disconnectBtn").onclick = () => {
+    if (ws) ws.close();
+  };
+
+  // ---- Microphone start/stop ----
+  $("startMicBtn").onclick = async () => {
+    try {
+      await ensureAudio();
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: true },
+      });
+      const source = audioCtx.createMediaStreamSource(micStream);
+      micNode = new AudioWorkletNode(audioCtx, "downsample-16k");
+      micNode.port.onmessage = (ev) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const buf = ev.data; // ArrayBuffer with Int16 PCM at 16kHz
+        ws.send(buf);        // send binary frame
+      };
+      source.connect(micNode);
+      // don’t connect micNode to destination; we only forward frames.
+      $("startMicBtn").disabled = true;
+      $("stopMicBtn").disabled = false;
+      log("🎙️ Мікрофон запущено @", audioCtx.sampleRate, "Hz (ресемпл до 16k)");
+    } catch (e) {
+      log("❌ Не вдалося отримати доступ до мікрофона:", e);
+    }
+  };
+
+  $("stopMicBtn").onclick = () => stopMic();
+
+  function stopMic() {
+    if (micNode) { try { micNode.disconnect(); } catch {} micNode = null; }
+    if (micStream) {
+      micStream.getTracks().forEach(t => t.stop());
+      micStream = null;
+    }
+    if (audioCtx && audioCtx.state !== "closed") {
+      // keep AudioContext for player
+    }
+    $("startMicBtn").disabled = !ws;
+    $("stopMicBtn").disabled = true;
+    log("⏹️ Мікрофон зупинено");
+  }
+
+  // ---- Send text turns ----
+  $("sendTextBtn").onclick = () => {
+    const text = $("textInput").value.trim();
+    const turnComplete = $("turnComplete").checked;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const payload = {};
+    if (text) payload.text = text;
+    if (turnComplete) payload.turn_complete = true;
+    ws.send(JSON.stringify(payload));
+    log("➡️ Надіслано:", payload);
+    $("textInput").value = "";
+    $("turnComplete").checked = false;
+  };
+
+  // ---- Playback: queue PCM16 @ 24kHz ----
+  async function playPcmChunk(arrayBuffer) {
+    try {
+      await ensureAudio();
+      const i16 = new Int16Array(arrayBuffer);
+      const length = i16.length;
+      const audioBuffer = audioCtx.createBuffer(1, length, MODEL_SAMPLE_RATE);
+      const ch = audioBuffer.getChannelData(0);
+      for (let i = 0; i < length; i++) {
+        ch[i] = Math.max(-1, Math.min(1, i16[i] / 32767));
+      }
+
+      const src = audioCtx.createBufferSource();
+      src.buffer = audioBuffer;
+
+      // Smooth scheduling to avoid clicks/gaps
+      const now = audioCtx.currentTime;
+      if (playerNextTime < now) playerNextTime = now + 0.02; // small headroom
+      src.connect(audioCtx.destination);
+      src.start(playerNextTime);
+      playerNextTime += audioBuffer.duration;
+    } catch (e) {
+      log("❌ Помилка відтворення:", e);
+    }
+  }
+})();
+</script>
+</body>
+</html>
