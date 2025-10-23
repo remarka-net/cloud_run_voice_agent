@@ -229,10 +229,12 @@
     switch(obj.type) {
       case "input_transcript":
         addTranscript("user", obj.text);
+        log("👤 Користувач сказав:", obj.text);
         break;
       
       case "output_transcript":
         addTranscript("assistant", obj.text);
+        log("🤖 Асистент сказав:", obj.text);
         isModelSpeaking = true;
         setStatus("Асистент говорить...", "status-listening");
         break;
@@ -240,11 +242,15 @@
       case "turn_complete":
         log("🔄 Turn complete - ready_for_input:", obj.ready_for_input);
         isModelSpeaking = false;
-        setStatus("Готовий до прослуховування", "status-connected");
         
-        // Auto re-enable mic if it was active
-        if (obj.ready_for_input && micStream) {
-          log("🎙️ Мікрофон готовий для наступного введення");
+        // ВАЖЛИВО: Відправляємо порожній turn_complete щоб модель знала що ми готові
+        if (obj.ready_for_input && ws && ws.readyState === WebSocket.OPEN) {
+          setTimeout(() => {
+            const payload = { turn_complete: true };
+            ws.send(JSON.stringify(payload));
+            log("➡️ Відправлено turn_complete для готовності");
+            setStatus("Готовий слухати (говоріть зараз)", "status-connected");
+          }, 500); // невелика затримка
         }
         break;
       
@@ -259,7 +265,8 @@
         break;
       
       case "heartbeat":
-        // Silent heartbeat
+        // Silent heartbeat - можна розкоментувати для debug
+        // log("💓 Heartbeat #" + obj.count);
         break;
       
       case "error":
@@ -449,3 +456,4 @@
 </html>
 
   
+
