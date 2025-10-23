@@ -9,9 +9,18 @@
     .row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
     input[type="text"] { width: 520px; padding: 8px; }
     button { padding: 8px 12px; }
-    .log { border: 1px solid #ccc; padding: 8px; height: 240px; overflow: auto; white-space: pre-wrap; background: #fafafa; }
+    .log { border: 1px solid #ccc; padding: 8px; height: 240px; overflow: auto; white-space: pre-wrap; background: #fafafa; font-size: 13px; }
     .small { font-size: 0.9em; color: #666; }
     label { display: inline-flex; align-items: center; gap: 6px; }
+    .status { padding: 10px; margin: 10px 0; border-radius: 5px; font-weight: bold; }
+    .status-connected { background: #d4edda; color: #155724; }
+    .status-listening { background: #d1ecf1; color: #0c5460; }
+    .status-disconnected { background: #f8d7da; color: #721c24; }
+    .transcripts { margin-top: 20px; padding: 10px; border: 1px solid #ddd; border-radius: 5px; background: #fff; }
+    .transcript { padding: 8px; margin: 5px 0; border-radius: 4px; }
+    .transcript-user { background: #e3f2fd; text-align: right; }
+    .transcript-assistant { background: #f1f8e9; }
+    .transcript-label { font-weight: bold; font-size: 11px; margin-bottom: 3px; opacity: 0.7; }
   </style>
 </head>
 <body>
@@ -28,6 +37,8 @@
     <button id="disconnectBtn" disabled>Завершити сеанс</button>
   </div>
 
+  <div id="statusBar" class="status status-disconnected">Не підключено</div>
+
   <hr/>
 
   <div class="row">
@@ -43,6 +54,9 @@
 
   <p class="small">Примітка: клієнт надсилає PCM16 mono @ 16kHz у двійкових фреймах; отримане аудіо (PCM16 mono @ 24kHz) відтворюється автоматично.</p>
 
+  <h3>Транскрипти</h3>
+  <div id="transcripts" class="transcripts"></div>
+
   <h3>Логи</h3>
   <div id="log" class="log"></div>
 
@@ -51,6 +65,9 @@
   // ---- UI helpers ----
   const $ = (id) => document.getElementById(id);
   const logBox = $("log");
+  const statusBar = $("statusBar");
+  const transcriptsBox = $("transcripts");
+  
   function log(...args) {
     const line = args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
     logBox.textContent += line + "\n";
@@ -58,26 +75,43 @@
     console.log(...args);
   }
 
+  function setStatus(text, className) {
+    statusBar.textContent = text;
+    statusBar.className = `status ${className}`;
+  }
+
+  function addTranscript(type, text) {
+    const div = document.createElement('div');
+    div.className = `transcript transcript-${type}`;
+    const label = document.createElement('div');
+    label.className = 'transcript-label';
+    label.textContent = type === 'user' ? 'Ви:' : 'Асистент:';
+    const content = document.createElement('div');
+    content.textContent = text;
+    div.appendChild(label);
+    div.appendChild(content);
+    transcriptsBox.appendChild(div);
+    transcriptsBox.scrollTop = transcriptsBox.scrollHeight;
+  }
+
   // ---- State ----
   let ws = null;
   let audioCtx = null;
   let micStream = null;
-  let micNode = null;        // AudioWorkletNode
-  let playerNextTime = 0;    // schedule time for next buffer
+  let micNode = null;
+  let playerNextTime = 0;
+  let isModelSpeaking = false;
+  let autoStopMicAfterResponse = false;
 
-  // Server audio format (from our FastAPI bridge / Google Live API)
-  const MODEL_SAMPLE_RATE = 24000; // matches server RECV_SAMPLE_RATE
-  // Client send format
-  const SEND_SAMPLE_RATE = 16000;  // must match server SEND_SAMPLE_RATE and MIME
+  const MODEL_SAMPLE_RATE = 24000;
+  const SEND_SAMPLE_RATE = 16000;
 
-  // ---- Audio: downsampler worklet (float32 -> PCM16 @16kHz) ----
+  // ---- Audio: downsampler worklet ----
   const workletCode = `
     class Downsample16k extends AudioWorkletProcessor {
       constructor() {
         super();
-        this._srcRate = sampleRate; // context sample rate (e.g., 48000)
-        this._acc = 0;
-        this._carry = 0;
+        this._srcRate = sampleRate;
         this._ratio = this._srcRate / 16000;
       }
       static get parameterDescriptors() { return []; }
@@ -85,11 +119,10 @@
       process(inputs, outputs, parameters) {
         const input = inputs[0];
         if (!input || input.length === 0) { return true; }
-        const ch0 = input[0]; // mono or take left
+        const ch0 = input[0];
         if (!ch0) return true;
 
-        const inBuf = ch0; // Float32Array
-        // Downsample with simple linear interpolation
+        const inBuf = ch0;
         const ratio = this._ratio;
         const outNeeded = Math.floor(inBuf.length / ratio) + 1;
         const outF32 = new Float32Array(outNeeded);
@@ -103,13 +136,11 @@
           outF32[idx++] = Math.max(-1, Math.min(1, s));
         }
 
-        // Convert to PCM16
         const outI16 = new Int16Array(outF32.length);
         for (let i = 0; i < outF32.length; i++) {
           outI16[i] = Math.max(-32768, Math.min(32767, Math.floor(outF32[i] * 32767)));
         }
 
-        // Post to main thread
         this.port.postMessage(outI16.buffer, [outI16.buffer]);
         return true;
       }
@@ -124,21 +155,26 @@
     const url = URL.createObjectURL(blob);
     await audioCtx.audioWorklet.addModule(url);
     URL.revokeObjectURL(url);
+    log("🔊 AudioContext створено @", audioCtx.sampleRate, "Hz");
   }
 
   // ---- WebSocket connect/disconnect ----
   $("connectBtn").onclick = async () => {
     const url = $("wsUrl").value.trim();
-    if (!url || !/^wss:\/\/.+/.test(url)) {
-      alert("Вкажіть правильний WebSocket URL (wss://...)");
+    if (!url || !/^wss?:\/\/.+/.test(url)) {
+      alert("Вкажіть правильний WebSocket URL (wss://... або ws://...)");
       return;
     }
+    
     try {
+      setStatus("Підключення...", "status-listening");
       ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
         log("✅ WebSocket з'єднано");
+        setStatus("Підключено", "status-connected");
+        $("connectBtn").disabled = true;
         $("disconnectBtn").disabled = false;
         $("startMicBtn").disabled = false;
         $("sendTextBtn").disabled = false;
@@ -146,25 +182,29 @@
 
       ws.onmessage = (ev) => {
         if (typeof ev.data === "string") {
-          // JSON events: transcripts, tool events, etc.
+          // JSON events
           try {
             const obj = JSON.parse(ev.data);
             log("📩 JSON:", obj);
+            handleJsonMessage(obj);
           } catch {
             log("📩 text:", ev.data);
           }
         } else if (ev.data instanceof ArrayBuffer) {
-          // Binary model audio (PCM16 @ 24kHz)
+          // Binary model audio
           playPcmChunk(ev.data);
         }
       };
 
-      ws.onerror = (e) => log("❌ WS error:", e.message || e);
-      ws.onerror = (e) => log("❌ WS error event (див. onclose для деталей)", e);
-      ws.onclose = (ev) => log("ℹ️ WS closed", { code: ev.code, reason: ev.reason });
-``
-      ws.onclose = () => {
-        log("ℹ️ WebSocket закрито");
+      ws.onerror = (e) => {
+        log("❌ WS error event:", e);
+        setStatus("Помилка з'єднання", "status-disconnected");
+      };
+
+      ws.onclose = (ev) => {
+        log(`ℹ️ WS closed - Code: ${ev.code}, Reason: ${ev.reason || 'none'}, Clean: ${ev.wasClean}`);
+        setStatus("Не підключено", "status-disconnected");
+        $("connectBtn").disabled = false;
         $("disconnectBtn").disabled = true;
         $("startMicBtn").disabled = true;
         $("stopMicBtn").disabled = true;
@@ -174,50 +214,127 @@
       };
     } catch (e) {
       log("❌ Не вдалося підключитися:", e);
+      setStatus("Помилка підключення", "status-disconnected");
     }
   };
 
   $("disconnectBtn").onclick = () => {
-    if (ws) ws.close();
+    if (ws) {
+      ws.close(1000, "User closed");
+    }
   };
+
+  // ---- Handle JSON messages from server ----
+  function handleJsonMessage(obj) {
+    switch(obj.type) {
+      case "input_transcript":
+        addTranscript("user", obj.text);
+        break;
+      
+      case "output_transcript":
+        addTranscript("assistant", obj.text);
+        isModelSpeaking = true;
+        setStatus("Асистент говорить...", "status-listening");
+        break;
+      
+      case "turn_complete":
+        log("🔄 Turn complete - ready_for_input:", obj.ready_for_input);
+        isModelSpeaking = false;
+        setStatus("Готовий до прослуховування", "status-connected");
+        
+        // Auto re-enable mic if it was active
+        if (obj.ready_for_input && micStream) {
+          log("🎙️ Мікрофон готовий для наступного введення");
+        }
+        break;
+      
+      case "interruption":
+        log("⚠️ Переривання виявлено");
+        isModelSpeaking = false;
+        setStatus("Перервано - готовий слухати", "status-connected");
+        break;
+      
+      case "tool_response_sent":
+        log("🔧 Tool response sent:", obj.name);
+        break;
+      
+      case "heartbeat":
+        // Silent heartbeat
+        break;
+      
+      case "error":
+        log("❌ Server error:", obj.message);
+        setStatus("Помилка сервера", "status-disconnected");
+        break;
+      
+      default:
+        log("📦 Unknown message type:", obj.type);
+    }
+  }
 
   // ---- Microphone start/stop ----
   $("startMicBtn").onclick = async () => {
     try {
       await ensureAudio();
+      
+      // Resume AudioContext if suspended
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+      
       micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: true },
+        audio: { 
+          channelCount: 1, 
+          sampleRate: { ideal: 48000 },
+          noiseSuppression: true, 
+          echoCancellation: true,
+          autoGainControl: true
+        },
       });
+      
       const source = audioCtx.createMediaStreamSource(micStream);
       micNode = new AudioWorkletNode(audioCtx, "downsample-16k");
+      
       micNode.port.onmessage = (ev) => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const buf = ev.data; // ArrayBuffer with Int16 PCM at 16kHz
-        ws.send(buf);        // send binary frame
+        const buf = ev.data;
+        ws.send(buf);
       };
+      
       source.connect(micNode);
-      // don’t connect micNode to destination; we only forward frames.
+      
       $("startMicBtn").disabled = true;
       $("stopMicBtn").disabled = false;
-      log("🎙️ Мікрофон запущено @", audioCtx.sampleRate, "Hz (ресемпл до 16k)");
+      setStatus("Слухаю...", "status-listening");
+      log("🎙️ Мікрофон запущено @", audioCtx.sampleRate, "Hz → 16kHz");
     } catch (e) {
       log("❌ Не вдалося отримати доступ до мікрофона:", e);
+      alert("Помилка доступу до мікрофона: " + e.message);
     }
   };
 
   $("stopMicBtn").onclick = () => stopMic();
 
   function stopMic() {
-    if (micNode) { try { micNode.disconnect(); } catch {} micNode = null; }
+    if (micNode) { 
+      try { 
+        micNode.port.onmessage = null;
+        micNode.disconnect(); 
+      } catch(e) { 
+        log("Warning disconnecting micNode:", e); 
+      } 
+      micNode = null; 
+    }
     if (micStream) {
       micStream.getTracks().forEach(t => t.stop());
       micStream = null;
     }
-    if (audioCtx && audioCtx.state !== "closed") {
-      // keep AudioContext for player
-    }
-    $("startMicBtn").disabled = !ws;
+    $("startMicBtn").disabled = !ws || ws.readyState !== WebSocket.OPEN;
     $("stopMicBtn").disabled = true;
+    
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      setStatus("Підключено", "status-connected");
+    }
     log("⏹️ Мікрофон зупинено");
   }
 
@@ -226,23 +343,51 @@
     const text = $("textInput").value.trim();
     const turnComplete = $("turnComplete").checked;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    
     const payload = {};
     if (text) payload.text = text;
     if (turnComplete) payload.turn_complete = true;
+    
+    // Don't send empty payload
+    if (!text && !turnComplete) return;
+    
     ws.send(JSON.stringify(payload));
     log("➡️ Надіслано:", payload);
+    
+    if (text) {
+      addTranscript("user", text);
+    }
+    
     $("textInput").value = "";
     $("turnComplete").checked = false;
   };
 
+  // Allow Enter key to send
+  $("textInput").addEventListener("keypress", (e) => {
+    if (e.key === "Enter") {
+      $("sendTextBtn").click();
+    }
+  });
+
   // ---- Playback: queue PCM16 @ 24kHz ----
-  async function playPcmChunk(arrayBuffer) {
+
+    async function playPcmChunk(arrayBuffer) {
     try {
       await ensureAudio();
+      
+      // Resume AudioContext if suspended (browser autoplay policy)
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+      
       const i16 = new Int16Array(arrayBuffer);
       const length = i16.length;
+      
+      if (length === 0) return;
+      
       const audioBuffer = audioCtx.createBuffer(1, length, MODEL_SAMPLE_RATE);
       const ch = audioBuffer.getChannelData(0);
+      
       for (let i = 0; i < length; i++) {
         ch[i] = Math.max(-1, Math.min(1, i16[i] / 32767));
       }
@@ -252,16 +397,55 @@
 
       // Smooth scheduling to avoid clicks/gaps
       const now = audioCtx.currentTime;
-      if (playerNextTime < now) playerNextTime = now + 0.02; // small headroom
+      if (playerNextTime < now) {
+        playerNextTime = now + 0.02; // small headroom
+      }
+      
       src.connect(audioCtx.destination);
       src.start(playerNextTime);
       playerNextTime += audioBuffer.duration;
+      
+      // Optional: log first audio chunk
+      if (!isModelSpeaking) {
+        log("🔊 Починаю відтворення аудіо від моделі");
+        isModelSpeaking = true;
+      }
     } catch (e) {
       log("❌ Помилка відтворення:", e);
     }
   }
+
+  // ---- Auto-fill WebSocket URL on page load ----
+  window.addEventListener('DOMContentLoaded', () => {
+    // Try to detect if running locally or need production URL
+    const hostname = window.location.hostname;
+    
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      // Local development
+      $("wsUrl").value = "ws://localhost:8080/audio";
+    } else {
+      // Production - construct from current page URL
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      $("wsUrl").value = `${protocol}//${hostname}/audio`;
+    }
+    
+    log("ℹ️ Сторінка завантажена. Введіть WebSocket URL та натисніть 'Почати сеанс'");
+  });
+
+  // ---- Cleanup on page unload ----
+  window.addEventListener('beforeunload', () => {
+    stopMic();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.close(1000, "Page unload");
+    }
+    if (audioCtx && audioCtx.state !== 'closed') {
+      audioCtx.close();
+    }
+  });
+
 })();
 </script>
 </body>
-
 </html>
+
+  
